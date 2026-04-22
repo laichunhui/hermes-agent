@@ -62,6 +62,26 @@ if _loaded_env_paths:
 else:
     logger.info("No .env file found. Using system environment variables.")
 
+def _append_azure_debug_log(entry: Dict[str, Any]) -> None:
+    """Write debug request payloads to ./logs/azure-requests.log when enabled."""
+    if str(os.getenv("AZURE_DEBUG_LOG", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        log_dir = Path.cwd() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "azure-requests.log"
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"timestamp": datetime.utcnow().isoformat() + "Z", **entry},
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+            fh.write("\n")
+    except Exception:
+        logger.exception("Failed to write azure debug log")
+
 
 # Import our tool system
 from model_tools import (
@@ -9337,6 +9357,16 @@ class AIAgent:
                 try:
                     self._reset_stream_delivery_tracking()
                     api_kwargs = self._build_api_kwargs(api_messages)
+                    _append_azure_debug_log(
+                        {
+                            "kind": "hermes_final_payload",
+                            "model": self.model,
+                            "provider": self.provider,
+                            "base_url": self.base_url,
+                            "api_mode": self.api_mode,
+                            "payload": api_kwargs,
+                        }
+                    )
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
