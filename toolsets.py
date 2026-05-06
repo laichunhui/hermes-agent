@@ -323,6 +323,12 @@ TOOLSETS = {
         ],
         "includes": []
     },
+
+    "hermes-kriki-server": {
+        "description": "Kriki Responses-compatible API server — narrow HTTP interface with API-server tool availability",
+        "tools": [],
+        "includes": ["hermes-api-server"]
+    },
     
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
