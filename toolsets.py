@@ -325,9 +325,11 @@ TOOLSETS = {
     },
 
     "hermes-kriki-server": {
-        "description": "Kriki Responses-compatible API server — narrow HTTP interface with API-server tool availability",
-        "tools": [],
-        "includes": ["hermes-api-server"]
+        "description": "Kriki watch API server — narrow watch-control tool surface with skills preloaded outside the model",
+        "tools": [
+            "todo", "memory",
+        ],
+        "includes": []
     },
     
     "hermes-cli": {

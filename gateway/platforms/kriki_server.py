@@ -41,6 +41,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4088
 DEFAULT_AGENT_CACHE_MAX_SIZE = 128
 DEFAULT_AGENT_CACHE_IDLE_TTL_SECS = 3600.0
+KRIKI_WATCH_COMMAND = "/kriki-watch"
 
 
 def check_kriki_server_requirements() -> bool:
@@ -110,7 +111,10 @@ class KrikiServerAdapter(APIServerAdapter):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "kriki_server"))
+        enabled_toolsets = sorted(
+            ts for ts in _get_platform_tools(user_config, "kriki_server")
+            if ts != "skills"
+        )
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
         fallback_model = GatewayRunner._load_fallback_model()
 
@@ -188,6 +192,37 @@ class KrikiServerAdapter(APIServerAdapter):
 
         while len(self._agent_cache) > self._agent_cache_max_size:
             self._agent_cache.popitem(last=False)
+
+    @staticmethod
+    def _strip_kriki_watch_prefix(message: Any) -> Any:
+        if not isinstance(message, str):
+            return message
+        stripped = message.strip()
+        if not stripped.startswith(KRIKI_WATCH_COMMAND):
+            return message
+        remainder = stripped[len(KRIKI_WATCH_COMMAND):].strip()
+        return remainder or stripped
+
+    def _build_kriki_watch_message(self, user_message: Any, session_id: str) -> Any:
+        if not isinstance(user_message, str):
+            return user_message
+        try:
+            from agent.skill_commands import build_skill_invocation_message
+
+            user_instruction = self._strip_kriki_watch_prefix(user_message)
+            msg = build_skill_invocation_message(
+                KRIKI_WATCH_COMMAND,
+                str(user_instruction),
+                task_id=session_id,
+                runtime_note=(
+                    "Kriki API requests always use the kriki-watch skill. "
+                    "Ignore other skills and do not call skill discovery/view tools."
+                ),
+            )
+            return msg or user_message
+        except Exception as e:
+            logger.warning("Failed to preload %s skill for Kriki request: %s", KRIKI_WATCH_COMMAND, e)
+            return user_message
 
     async def _run_agent(
         self,
@@ -342,6 +377,7 @@ class KrikiServerAdapter(APIServerAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or str(uuid.uuid4())
+        user_message = self._build_kriki_watch_message(user_message, session_id)
         stream = bool(body.get("stream", False))
         if stream:
             import queue as _q

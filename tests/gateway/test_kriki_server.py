@@ -289,6 +289,24 @@ class TestKrikiAgentCache:
         assert call_kwargs["tool_complete_callback"] is not None
 
     @pytest.mark.asyncio
+    async def test_preloads_kriki_watch_before_agent(self):
+        adapter = _make_adapter()
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+             patch("agent.skill_commands.build_skill_invocation_message", return_value="[kriki-watch loaded]\n打开运动") as mock_skill:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            resp = await adapter._handle_kriki_responses(_FakeRequest(
+                {"input": "/kriki-watch 打开运动"},
+                headers={"X-Hermes-Session-Id": "session-1"},
+            ))
+
+        assert resp.status == 200
+        mock_skill.assert_called_once()
+        assert mock_skill.call_args.args[0] == "/kriki-watch"
+        assert mock_skill.call_args.args[1] == "打开运动"
+        assert mock_run.call_args.kwargs["user_message"] == "[kriki-watch loaded]\n打开运动"
+
+    @pytest.mark.asyncio
     async def test_run_agent_temporarily_sets_stream_callbacks(self):
         adapter = _make_adapter()
         seen_callbacks = {}
@@ -339,6 +357,38 @@ class TestKrikiServerToolset:
 
         assert "kriki_server" in PLATFORMS
         assert PLATFORMS["kriki_server"]["default_toolset"] == "hermes-kriki-server"
+
+    def test_default_toolset_blocks_general_skill_tools(self):
+        from toolsets import resolve_toolset
+
+        tools = resolve_toolset("hermes-kriki-server")
+        assert "skill_view" not in tools
+        assert "skills_list" not in tools
+        assert "skill_manage" not in tools
+
+    @patch("gateway.platforms.kriki_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_filters_explicit_skills_toolset(self):
+        adapter = _make_adapter()
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model") as mock_model, \
+             patch("gateway.run._load_gateway_config") as mock_config, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_kwargs.return_value = {
+                "api_key": "test-key",
+                "base_url": None,
+                "provider": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {"platform_toolsets": {"kriki_server": ["skills", "memory"]}}
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent()
+
+            call_kwargs = mock_agent_cls.call_args.kwargs
+            assert call_kwargs["enabled_toolsets"] == ["memory"]
 
     @patch("gateway.platforms.kriki_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_uses_kriki_platform_toolsets(self):
