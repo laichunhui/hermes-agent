@@ -37,7 +37,7 @@ from gateway.platforms.base import SendResult, is_network_accessible
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 4088
 DEFAULT_AGENT_CACHE_MAX_SIZE = 128
 DEFAULT_AGENT_CACHE_IDLE_TTL_SECS = 3600.0
@@ -51,6 +51,11 @@ def check_kriki_server_requirements() -> bool:
 
 class KrikiServerAdapter(APIServerAdapter):
     """Narrow Responses-compatible HTTP adapter for Kriki clients."""
+
+    # Cached kriki-watch skill message template: (prefix, suffix) around the
+    # user instruction, or (None, None) when the skill doesn't exist.  Built
+    # once at init to eliminate per-request disk IO and skill scanning.
+    _KRIKI_WATCH_PLACEHOLDER = "___KRIKI_USER_INSTRUCTION___"
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config)
@@ -73,6 +78,9 @@ class KrikiServerAdapter(APIServerAdapter):
         )
         self._agent_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._agent_cache_lock = threading.RLock()
+        # Pre-load the kriki-watch skill template once at startup to eliminate
+        # per-request disk IO, file scanning, and string formatting.
+        self._kriki_watch_prefix, self._kriki_watch_suffix = self._preload_kriki_watch_template()
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -112,8 +120,7 @@ class KrikiServerAdapter(APIServerAdapter):
         model = _resolve_gateway_model()
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(
-            ts for ts in _get_platform_tools(user_config, "kriki_server")
-            if ts != "skills"
+            _get_platform_tools(user_config, "kriki_server")
         )
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
         fallback_model = GatewayRunner._load_fallback_model()
@@ -193,36 +200,83 @@ class KrikiServerAdapter(APIServerAdapter):
         while len(self._agent_cache) > self._agent_cache_max_size:
             self._agent_cache.popitem(last=False)
 
-    @staticmethod
-    def _strip_kriki_watch_prefix(message: Any) -> Any:
-        if not isinstance(message, str):
-            return message
-        stripped = message.strip()
-        if not stripped.startswith(KRIKI_WATCH_COMMAND):
-            return message
-        remainder = stripped[len(KRIKI_WATCH_COMMAND):].strip()
-        return remainder or stripped
+    def _preload_kriki_watch_template(self) -> tuple:
+        """Pre-load the kriki-watch skill message template at init time.
 
-    def _build_kriki_watch_message(self, user_message: Any, session_id: str) -> Any:
-        if not isinstance(user_message, str):
-            return user_message
+        Returns (prefix, suffix) where prefix is everything before the user
+        instruction placeholder and suffix is everything after.  If the skill
+        doesn't exist or fails to load, returns (None, None).
+
+        This eliminates per-request disk IO (file scanning + skill read) and
+        string formatting, which were the dominant latency contributors.
+        """
         try:
             from agent.skill_commands import build_skill_invocation_message
 
-            user_instruction = self._strip_kriki_watch_prefix(user_message)
             msg = build_skill_invocation_message(
                 KRIKI_WATCH_COMMAND,
-                str(user_instruction),
-                task_id=session_id,
+                self._KRIKI_WATCH_PLACEHOLDER,
+                task_id=None,
                 runtime_note=(
                     "Kriki API requests always use the kriki-watch skill. "
                     "Ignore other skills and do not call skill discovery/view tools."
                 ),
             )
-            return msg or user_message
+            if not msg:
+                logger.debug(
+                    "Kriki-watch skill (%s) not found — messages will be forwarded as-is.",
+                    KRIKI_WATCH_COMMAND,
+                )
+                return None, None
+
+            # Split the formatted message around the placeholder to recover the
+            # static prefix and suffix.  The user instruction is injected at
+            # request time.
+            parts = msg.split(self._KRIKI_WATCH_PLACEHOLDER, 1)
+            if len(parts) == 2:
+                prefix, suffix = parts[0], parts[1]
+            else:
+                prefix, suffix = msg, ""
+            logger.info(
+                "Pre-loaded kriki-watch skill template (%d chars prefix, %d chars suffix).",
+                len(prefix), len(suffix),
+            )
+            return prefix, suffix
         except Exception as e:
-            logger.warning("Failed to preload %s skill for Kriki request: %s", KRIKI_WATCH_COMMAND, e)
+            logger.warning(
+                "Failed to preload %s skill template: %s — per-request loading will be used as fallback.",
+                KRIKI_WATCH_COMMAND, e,
+            )
+            return None, None
+
+    def _build_kriki_watch_message(self, user_message: Any, session_id: str) -> Any:
+        """Wrap the user message with the kriki-watch skill ONLY when the user
+        explicitly types the /kriki-watch slash command.
+
+        Matches the CLI pattern: skills are injected on explicit invocation,
+        not applied to every message.  Uses the cached template (built at init
+        time) to avoid per-request disk IO.
+        """
+        if not isinstance(user_message, str):
             return user_message
+
+        # Only inject the skill when the user explicitly invokes /kriki-watch.
+        # The user can type "/kriki-watch 打开运动" or just "打开运动" — only
+        # the former triggers skill injection.  This matches CLI's slash-command
+        # dispatch in cli.py (lines 6415–6426).
+        stripped = user_message.strip()
+        if not stripped.startswith(KRIKI_WATCH_COMMAND):
+            # No explicit slash command — pass the message through as-is.
+            return user_message
+
+        user_instruction = stripped[len(KRIKI_WATCH_COMMAND):].strip()
+        prefix, suffix = self._kriki_watch_prefix, self._kriki_watch_suffix
+
+        if prefix is None:
+            # Skill wasn't available at init — forward the instruction as-is.
+            return user_instruction or user_message
+
+        return f"{prefix}{user_instruction}{suffix}"
 
     async def _run_agent(
         self,
@@ -378,6 +432,26 @@ class KrikiServerAdapter(APIServerAdapter):
 
         session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or str(uuid.uuid4())
         user_message = self._build_kriki_watch_message(user_message, session_id)
+
+        # Use a fixed (empty) ephemeral system prompt for all kriki_server
+        # requests so that the system prompt is identical across sessions,
+        # maximizing LLM prompt-cache hit rates.  The kriki-watch skill
+        # already injects all necessary instructions into the user message.
+        # Per-request "instructions" in the API body are ignored — clients
+        # should embed instructions in the user message or the skill.
+        _instructions = body.get("instructions")
+        if _instructions is not None and self._kriki_watch_prefix is None:
+            # kriki-watch skill not available — fall back to per-request
+            # instructions so clients still get some context.
+            ephemeral_system_prompt = str(_instructions)
+            logger.debug(
+                "Kriki-watch skill unavailable, using per-request instructions "
+                "(%d chars) as ephemeral_system_prompt.",
+                len(ephemeral_system_prompt),
+            )
+        else:
+            ephemeral_system_prompt = None
+
         stream = bool(body.get("stream", False))
         if stream:
             import queue as _q
@@ -410,7 +484,7 @@ class KrikiServerAdapter(APIServerAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=body.get("instructions"),
+                ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -429,7 +503,7 @@ class KrikiServerAdapter(APIServerAdapter):
                 agent_ref=agent_ref,
                 conversation_history=conversation_history,
                 user_message=user_message,
-                instructions=body.get("instructions"),
+                instructions=ephemeral_system_prompt,
                 conversation=None,
                 store=False,
                 session_id=session_id,
@@ -439,7 +513,7 @@ class KrikiServerAdapter(APIServerAdapter):
             result, usage = await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=body.get("instructions"),
+                ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
             )
         except Exception as e:
@@ -497,7 +571,7 @@ class KrikiServerAdapter(APIServerAdapter):
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
-                    _s.connect(("127.0.0.1", self._port))
+                    _s.connect(("0.0.0.0", self._port))
                 logger.error(
                     "[%s] Port %d already in use. Set a different port in config.yaml: platforms.kriki_server.port",
                     self.name, self._port,

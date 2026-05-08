@@ -290,10 +290,24 @@ class TestKrikiAgentCache:
 
     @pytest.mark.asyncio
     async def test_preloads_kriki_watch_before_agent(self):
-        adapter = _make_adapter()
+        """Verify that the kriki-watch skill template is pre-loaded at init time
+        and the cached prefix/suffix is used at request time (no per-request
+        build_skill_invocation_message call)."""
+        # Preload at init time by mocking skill before adapter creation.
+        with patch("agent.skill_commands.build_skill_invocation_message",
+                   return_value="[kriki-watch loaded]\n___KRIKI_USER_INSTRUCTION___\n[Runtime note: ...]") as mock_skill_preload:
+            adapter = _make_adapter()
+
+        # Verify the skill was loaded exactly once (at init).
+        mock_skill_preload.assert_called_once()
+        assert adapter._kriki_watch_prefix is not None
+        assert adapter._kriki_watch_suffix is not None
+
+        # Now run a request — the cached template should be used without
+        # calling build_skill_invocation_message again.
         mock_result = {"final_response": "ok", "messages": []}
         with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
-             patch("agent.skill_commands.build_skill_invocation_message", return_value="[kriki-watch loaded]\n打开运动") as mock_skill:
+             patch("agent.skill_commands.build_skill_invocation_message") as mock_skill_request:
             mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
             resp = await adapter._handle_kriki_responses(_FakeRequest(
                 {"input": "/kriki-watch 打开运动"},
@@ -301,10 +315,32 @@ class TestKrikiAgentCache:
             ))
 
         assert resp.status == 200
-        mock_skill.assert_called_once()
-        assert mock_skill.call_args.args[0] == "/kriki-watch"
-        assert mock_skill.call_args.args[1] == "打开运动"
-        assert mock_run.call_args.kwargs["user_message"] == "[kriki-watch loaded]\n打开运动"
+        # build_skill_invocation_message must NOT be called during the request.
+        mock_skill_request.assert_not_called()
+        # The user_message should use the pre-loaded template.
+        assert "[kriki-watch loaded]" in mock_run.call_args.kwargs["user_message"]
+        assert "打开运动" in mock_run.call_args.kwargs["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_raw_message_when_skill_unavailable(self):
+        """When kriki-watch skill doesn't exist, messages pass through as-is."""
+        with patch("agent.skill_commands.build_skill_invocation_message", return_value=None):
+            adapter = _make_adapter()
+
+        assert adapter._kriki_watch_prefix is None
+        assert adapter._kriki_watch_suffix is None
+
+        # The message should pass through unmodified.
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            resp = await adapter._handle_kriki_responses(_FakeRequest(
+                {"input": "打开运动"},
+                headers={"X-Hermes-Session-Id": "session-1"},
+            ))
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["user_message"] == "打开运动"
 
     @pytest.mark.asyncio
     async def test_run_agent_temporarily_sets_stream_callbacks(self):
@@ -358,16 +394,18 @@ class TestKrikiServerToolset:
         assert "kriki_server" in PLATFORMS
         assert PLATFORMS["kriki_server"]["default_toolset"] == "hermes-kriki-server"
 
-    def test_default_toolset_blocks_general_skill_tools(self):
+    def test_default_toolset_includes_skill_tools(self):
         from toolsets import resolve_toolset
 
         tools = resolve_toolset("hermes-kriki-server")
-        assert "skill_view" not in tools
-        assert "skills_list" not in tools
-        assert "skill_manage" not in tools
+        assert "skill_view" in tools
+        assert "skills_list" in tools
 
     @patch("gateway.platforms.kriki_server.AIOHTTP_AVAILABLE", True)
-    def test_create_agent_filters_explicit_skills_toolset(self):
+    def test_create_agent_keeps_skills_toolset(self):
+        """skills toolset is NOT filtered out — the agent needs skill_view
+        and skills_list to interact with skills even when kriki-watch is
+        preloaded."""
         adapter = _make_adapter()
         with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
              patch("gateway.run._resolve_gateway_model") as mock_model, \
@@ -388,7 +426,7 @@ class TestKrikiServerToolset:
             adapter._create_agent()
 
             call_kwargs = mock_agent_cls.call_args.kwargs
-            assert call_kwargs["enabled_toolsets"] == ["memory"]
+            assert set(call_kwargs["enabled_toolsets"]) == {"memory", "skills"}
 
     @patch("gateway.platforms.kriki_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_uses_kriki_platform_toolsets(self):
