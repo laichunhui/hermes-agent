@@ -10788,6 +10788,7 @@ class AIAgent:
                 try:
                     self._reset_stream_delivery_tracking()
                     api_kwargs = self._build_api_kwargs(api_messages)
+                    print(f"api_kwargs: {api_kwargs}")
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":

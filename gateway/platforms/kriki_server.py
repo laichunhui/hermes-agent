@@ -249,13 +249,22 @@ class KrikiServerAdapter(APIServerAdapter):
             )
             return None, None
 
-    def _build_kriki_watch_message(self, user_message: Any, session_id: str) -> Any:
+    def _build_kriki_watch_message(
+        self,
+        user_message: Any,
+        session_id: str,
+        device_id: str = "",
+    ) -> Any:
         """Wrap the user message with the kriki-watch skill ONLY when the user
         explicitly types the /kriki-watch slash command.
 
         Matches the CLI pattern: skills are injected on explicit invocation,
         not applied to every message.  Uses the cached template (built at init
         time) to avoid per-request disk IO.
+
+        When *device_id* is provided it is prepended to the user instruction as
+        a structured context line so that the kriki-watch skill (and any tool
+        inside the agent) knows which watch to target.
         """
         if not isinstance(user_message, str):
             return user_message
@@ -265,8 +274,14 @@ class KrikiServerAdapter(APIServerAdapter):
         # the former triggers skill injection.  This matches CLI's slash-command
         # dispatch in cli.py (lines 6415–6426).
         stripped = user_message.strip()
+        device_prefix = f"[Target device: {device_id}]\n" if device_id else ""
+
         if not stripped.startswith(KRIKI_WATCH_COMMAND):
-            # No explicit slash command — pass the message through as-is.
+            # No explicit slash command — pass the message through, optionally
+            # prepending the device context so plain messages also carry the
+            # target device.
+            if device_id:
+                return f"{device_prefix}{stripped}"
             return user_message
 
         user_instruction = stripped[len(KRIKI_WATCH_COMMAND):].strip()
@@ -274,9 +289,10 @@ class KrikiServerAdapter(APIServerAdapter):
 
         if prefix is None:
             # Skill wasn't available at init — forward the instruction as-is.
-            return user_instruction or user_message
+            raw = user_instruction or user_message
+            return f"{device_prefix}{raw}" if device_id else raw
 
-        return f"{prefix}{user_instruction}{suffix}"
+        return f"{prefix}{device_prefix}{user_instruction}{suffix}"
 
     async def _run_agent(
         self,
@@ -431,16 +447,38 @@ class KrikiServerAdapter(APIServerAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or str(uuid.uuid4())
-        user_message = self._build_kriki_watch_message(user_message, session_id)
 
-        # Use a fixed (empty) ephemeral system prompt for all kriki_server
-        # requests so that the system prompt is identical across sessions,
-        # maximizing LLM prompt-cache hit rates.  The kriki-watch skill
-        # already injects all necessary instructions into the user message.
-        # Per-request "instructions" in the API body are ignored — clients
-        # should embed instructions in the user message or the skill.
+        # Extract optional per-request parameters.
+        device_id: str = (body.get("device_id") or "").strip()
+        language: str = (body.get("language") or "").strip()
+
+        user_message = self._build_kriki_watch_message(user_message, session_id, device_id=device_id)
+
+        # Build the ephemeral system prompt.
+        #
+        # The default strategy is to keep it fixed (empty) across sessions so
+        # that LLM prompt-cache hit rates are maximised.  Two exceptions:
+        #
+        #   1. *language* is set — we inject a language directive so the agent
+        #      responds in the requested language.  Sessions that share the
+        #      same language still benefit from cache hits.
+        #
+        #   2. The kriki-watch skill is unavailable AND the caller supplied
+        #      explicit *instructions* — fall back to per-request instructions
+        #      so clients still get some context (legacy behaviour).
         _instructions = body.get("instructions")
-        if _instructions is not None and self._kriki_watch_prefix is None:
+        if language:
+            language_directive = f"Always respond in {language}."
+            if _instructions is not None and self._kriki_watch_prefix is None:
+                # Combine language directive with fallback instructions.
+                ephemeral_system_prompt = f"{language_directive}\n{_instructions}"
+            else:
+                ephemeral_system_prompt = language_directive
+            logger.debug(
+                "Kriki request with language=%r; ephemeral_system_prompt set (%d chars).",
+                language, len(ephemeral_system_prompt),
+            )
+        elif _instructions is not None and self._kriki_watch_prefix is None:
             # kriki-watch skill not available — fall back to per-request
             # instructions so clients still get some context.
             ephemeral_system_prompt = str(_instructions)

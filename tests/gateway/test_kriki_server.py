@@ -178,6 +178,153 @@ class TestKrikiResponsesEndpoint:
         assert output[1]["content"][0]["text"] == "最终答复"
 
 
+class TestKrikiDeviceIdAndLanguage:
+    """Tests for the device_id and language request parameters."""
+
+    # ── device_id ──────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_device_id_injected_into_plain_message(self):
+        """device_id is prepended to a plain (non-slash-command) user message."""
+        adapter = _make_adapter()
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            resp = await adapter._handle_kriki_responses(_FakeRequest(
+                {"input": "打开运动", "device_id": "watch-abc123"},
+            ))
+
+        assert resp.status == 200
+        user_msg = mock_run.call_args.kwargs["user_message"]
+        assert "[Target device: watch-abc123]" in user_msg
+        assert "打开运动" in user_msg
+
+    @pytest.mark.asyncio
+    async def test_device_id_injected_into_kriki_watch_command(self):
+        """device_id appears inside the skill-wrapped message for /kriki-watch."""
+        with patch("agent.skill_commands.build_skill_invocation_message",
+                   return_value="[skill]\n___KRIKI_USER_INSTRUCTION___\n[end]"):
+            adapter = _make_adapter()
+
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            resp = await adapter._handle_kriki_responses(_FakeRequest(
+                {"input": "/kriki-watch 开始跑步", "device_id": "watch-xyz"},
+            ))
+
+        assert resp.status == 200
+        user_msg = mock_run.call_args.kwargs["user_message"]
+        assert "[skill]" in user_msg
+        assert "[Target device: watch-xyz]" in user_msg
+        assert "开始跑步" in user_msg
+
+    def test_no_device_id_message_passes_through_unchanged(self):
+        """When device_id is absent the message is unchanged (plain case)."""
+        adapter = _make_adapter()
+        result = adapter._build_kriki_watch_message("打开运动", "session-1", device_id="")
+        assert result == "打开运动"
+
+    def test_empty_device_id_ignored(self):
+        adapter = _make_adapter()
+        result = adapter._build_kriki_watch_message("打开运动", "session-1", device_id="  ")
+        # Adapter strips whitespace at the handler level; _build_kriki_watch_message
+        # receives the already-stripped value.  Empty string → no prefix.
+        assert result == "打开运动"
+
+    # ── language ───────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_language_sets_ephemeral_system_prompt(self):
+        """language param produces an 'Always respond in X' ephemeral prompt."""
+        adapter = _make_adapter()
+        mock_result = {"final_response": "Hola", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            resp = await adapter._handle_kriki_responses(_FakeRequest(
+                {"input": "hello", "language": "Spanish"},
+            ))
+
+        assert resp.status == 200
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
+        assert "Spanish" in (ephemeral or "")
+        assert "Always respond in" in (ephemeral or "")
+
+    @pytest.mark.asyncio
+    async def test_no_language_keeps_empty_ephemeral_prompt(self):
+        """Without language the ephemeral prompt stays None (cache-friendly)."""
+        adapter = _make_adapter()
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            await adapter._handle_kriki_responses(_FakeRequest({"input": "hello"}))
+
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt")
+        assert ephemeral is None
+
+    @pytest.mark.asyncio
+    async def test_language_combined_with_fallback_instructions(self):
+        """language + instructions (when skill absent) are merged."""
+        with patch("agent.skill_commands.build_skill_invocation_message", return_value=None):
+            adapter = _make_adapter()
+
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            await adapter._handle_kriki_responses(_FakeRequest({
+                "input": "hello",
+                "language": "Japanese",
+                "instructions": "You are a helpful assistant.",
+            }))
+
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
+        assert "Japanese" in (ephemeral or "")
+        assert "You are a helpful assistant." in (ephemeral or "")
+
+    @pytest.mark.asyncio
+    async def test_language_overrides_skill_absence_instructions_suppression(self):
+        """Even when kriki-watch is available, language still sets ephemeral prompt."""
+        with patch("agent.skill_commands.build_skill_invocation_message",
+                   return_value="[skill]\n___KRIKI_USER_INSTRUCTION___\n[end]"):
+            adapter = _make_adapter()
+
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            await adapter._handle_kriki_responses(_FakeRequest({
+                "input": "hello",
+                "language": "zh-CN",
+                "instructions": "should be ignored",
+            }))
+
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
+        # language directive present; instructions should NOT be merged when
+        # kriki-watch skill is available.
+        assert "zh-CN" in (ephemeral or "")
+        assert "should be ignored" not in (ephemeral or "")
+
+    # ── device_id + language combined ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_device_id_and_language_together(self):
+        """Both device_id and language can be provided simultaneously."""
+        adapter = _make_adapter()
+        mock_result = {"final_response": "ok", "messages": []}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            resp = await adapter._handle_kriki_responses(_FakeRequest({
+                "input": "打开运动",
+                "device_id": "watch-001",
+                "language": "zh-CN",
+            }))
+
+        assert resp.status == 200
+        user_msg = mock_run.call_args.kwargs["user_message"]
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
+        assert "[Target device: watch-001]" in user_msg
+        assert "zh-CN" in (ephemeral or "")
+
+
 class TestKrikiAgentCache:
     @pytest.mark.asyncio
     async def test_reuses_agent_for_same_session_id(self):
