@@ -143,30 +143,32 @@ class KrikiServerAdapter(APIServerAdapter):
             fallback_model=fallback_model,
         )
 
-    def _get_cached_agent(
-        self,
-        session_id: str,
-        ephemeral_system_prompt: Optional[str] = None,
-    ) -> Any:
-        """Return a cached AIAgent for *session_id*, creating one on miss."""
+    def _get_cached_agent(self, session_id: str) -> Any:
+        """Return a cached AIAgent for *session_id*, creating one on miss.
+
+        The ``ephemeral_system_prompt`` is intentionally NOT a cache key here.
+        It is injected per-turn inside ``_run_agent`` (within the agent lock),
+        just like the stream/tool callbacks.  This ensures:
+
+        * The agent is never discarded just because ``language`` changed
+          between two requests on the same session.
+        * Language (or any other ephemeral directive) is always current for
+          the turn that is about to run, not stale from a prior request.
+        * Conversation continuity is preserved across language changes.
+        """
         now = time.time()
-        prompt = ephemeral_system_prompt or None
 
         with self._agent_cache_lock:
             self._prune_agent_cache_locked(now)
             cached = self._agent_cache.get(session_id)
-            if cached and cached.get("ephemeral_system_prompt") == prompt:
+            if cached:
                 cached["last_used"] = now
                 self._agent_cache.move_to_end(session_id)
                 return cached["agent"]
 
-            agent = self._create_agent(
-                ephemeral_system_prompt=prompt,
-                session_id=session_id,
-            )
+            agent = self._create_agent(session_id=session_id)
             self._agent_cache[session_id] = {
                 "agent": agent,
-                "ephemeral_system_prompt": prompt,
                 "created_at": now,
                 "last_used": now,
                 "lock": threading.RLock(),
@@ -254,6 +256,7 @@ class KrikiServerAdapter(APIServerAdapter):
         user_message: Any,
         session_id: str,
         device_id: str = "",
+        language: str = "",
     ) -> Any:
         """Wrap the user message with the kriki-watch skill ONLY when the user
         explicitly types the /kriki-watch slash command.
@@ -262,9 +265,12 @@ class KrikiServerAdapter(APIServerAdapter):
         not applied to every message.  Uses the cached template (built at init
         time) to avoid per-request disk IO.
 
-        When *device_id* is provided it is prepended to the user instruction as
-        a structured context line so that the kriki-watch skill (and any tool
-        inside the agent) knows which watch to target.
+        *device_id* and *language* are injected as structured context lines
+        **inside the user message** so the model sees them at the same attention
+        level as the actual instruction.  Putting them in the system prompt
+        (ephemeral_system_prompt) would bury them after a long prompt and make
+        them easy to ignore, especially when the skill content is in a different
+        language.
         """
         if not isinstance(user_message, str):
             return user_message
@@ -274,14 +280,23 @@ class KrikiServerAdapter(APIServerAdapter):
         # the former triggers skill injection.  This matches CLI's slash-command
         # dispatch in cli.py (lines 6415–6426).
         stripped = user_message.strip()
-        device_prefix = f"[Target device: {device_id}]\n" if device_id else ""
+
+        # Build a compact context prefix that carries both device and language
+        # directives in one block, e.g.:
+        #   [Target device: watch-abc]
+        #   [Response language: zh-CN]
+        context_lines = []
+        if device_id:
+            context_lines.append(f"[Target device: {device_id}]")
+        if language:
+            context_lines.append(f"[Response language: {language}]")
+        context_prefix = "\n".join(context_lines) + "\n" if context_lines else ""
 
         if not stripped.startswith(KRIKI_WATCH_COMMAND):
             # No explicit slash command — pass the message through, optionally
-            # prepending the device context so plain messages also carry the
-            # target device.
-            if device_id:
-                return f"{device_prefix}{stripped}"
+            # prepending the context block.
+            if context_prefix:
+                return f"{context_prefix}{stripped}"
             return user_message
 
         user_instruction = stripped[len(KRIKI_WATCH_COMMAND):].strip()
@@ -290,9 +305,9 @@ class KrikiServerAdapter(APIServerAdapter):
         if prefix is None:
             # Skill wasn't available at init — forward the instruction as-is.
             raw = user_instruction or user_message
-            return f"{device_prefix}{raw}" if device_id else raw
+            return f"{context_prefix}{raw}" if context_prefix else raw
 
-        return f"{prefix}{device_prefix}{user_instruction}{suffix}"
+        return f"{prefix}{context_prefix}{user_instruction}{suffix}"
 
     async def _run_agent(
         self,
@@ -311,25 +326,32 @@ class KrikiServerAdapter(APIServerAdapter):
         resolved_session_id = session_id or str(uuid.uuid4())
 
         def _run():
-            agent = self._get_cached_agent(
-                resolved_session_id,
-                ephemeral_system_prompt=ephemeral_system_prompt,
-            )
+            # Agent is keyed by session_id only.  ephemeral_system_prompt is
+            # injected per-turn (see below) so language changes never cause
+            # the agent to be discarded and conversation history is preserved.
+            agent = self._get_cached_agent(resolved_session_id)
             if agent_ref is not None:
                 agent_ref[0] = agent
 
             agent_lock = self._get_cached_agent_lock(resolved_session_id)
             with agent_lock:
-                previous_callbacks = {
+                # Save per-turn overridable attributes and restore them in
+                # finally so a cached agent is never left in a dirty state.
+                previous_state = {
                     "stream_delta_callback": getattr(agent, "stream_delta_callback", None),
                     "tool_progress_callback": getattr(agent, "tool_progress_callback", None),
                     "tool_start_callback": getattr(agent, "tool_start_callback", None),
                     "tool_complete_callback": getattr(agent, "tool_complete_callback", None),
+                    # ephemeral_system_prompt is per-turn: inject the current
+                    # request's language/instructions directive for this turn
+                    # and restore the previous value (typically None) afterwards.
+                    "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None),
                 }
                 agent.stream_delta_callback = stream_delta_callback
                 agent.tool_progress_callback = tool_progress_callback
                 agent.tool_start_callback = tool_start_callback
                 agent.tool_complete_callback = tool_complete_callback
+                agent.ephemeral_system_prompt = ephemeral_system_prompt or None
                 before_input = getattr(agent, "session_prompt_tokens", 0) or 0
                 before_output = getattr(agent, "session_completion_tokens", 0) or 0
                 before_total = getattr(agent, "session_total_tokens", 0) or 0
@@ -343,8 +365,8 @@ class KrikiServerAdapter(APIServerAdapter):
                     after_output = getattr(agent, "session_completion_tokens", 0) or 0
                     after_total = getattr(agent, "session_total_tokens", 0) or 0
                 finally:
-                    for name, callback in previous_callbacks.items():
-                        setattr(agent, name, callback)
+                    for name, value in previous_state.items():
+                        setattr(agent, name, value)
 
             usage = {
                 "input_tokens": max(0, after_input - before_input),
@@ -447,38 +469,29 @@ class KrikiServerAdapter(APIServerAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or str(uuid.uuid4())
-
+        print(f'start: {session_id}')
         # Extract optional per-request parameters.
         device_id: str = (body.get("device_id") or "").strip()
         language: str = (body.get("language") or "").strip()
 
-        user_message = self._build_kriki_watch_message(user_message, session_id, device_id=device_id)
+        user_message = self._build_kriki_watch_message(
+            user_message, session_id, device_id=device_id, language=language
+        )
 
         # Build the ephemeral system prompt.
         #
-        # The default strategy is to keep it fixed (empty) across sessions so
-        # that LLM prompt-cache hit rates are maximised.  Two exceptions:
+        # *language* and *device_id* are now injected directly into the user
+        # message (via _build_kriki_watch_message) so the model sees them at
+        # the same attention level as the actual instruction.  The ephemeral
+        # system prompt is therefore kept empty by default to maximise
+        # LLM prompt-cache hit rates.
         #
-        #   1. *language* is set — we inject a language directive so the agent
-        #      responds in the requested language.  Sessions that share the
-        #      same language still benefit from cache hits.
-        #
-        #   2. The kriki-watch skill is unavailable AND the caller supplied
-        #      explicit *instructions* — fall back to per-request instructions
-        #      so clients still get some context (legacy behaviour).
+        # The only exception is when the kriki-watch skill is unavailable AND
+        # the caller supplied explicit *instructions* — fall back to
+        # per-request instructions so clients still get some context (legacy
+        # behaviour).
         _instructions = body.get("instructions")
-        if language:
-            language_directive = f"Always respond in {language}."
-            if _instructions is not None and self._kriki_watch_prefix is None:
-                # Combine language directive with fallback instructions.
-                ephemeral_system_prompt = f"{language_directive}\n{_instructions}"
-            else:
-                ephemeral_system_prompt = language_directive
-            logger.debug(
-                "Kriki request with language=%r; ephemeral_system_prompt set (%d chars).",
-                language, len(ephemeral_system_prompt),
-            )
-        elif _instructions is not None and self._kriki_watch_prefix is None:
+        if _instructions is not None and self._kriki_watch_prefix is None:
             # kriki-watch skill not available — fall back to per-request
             # instructions so clients still get some context.
             ephemeral_system_prompt = str(_instructions)

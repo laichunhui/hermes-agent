@@ -235,8 +235,10 @@ class TestKrikiDeviceIdAndLanguage:
     # ── language ───────────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_language_sets_ephemeral_system_prompt(self):
-        """language param produces an 'Always respond in X' ephemeral prompt."""
+    async def test_language_injected_into_user_message(self):
+        """language param is injected as [Response language: X] in the user
+        message (not the ephemeral system prompt) so the model sees it at the
+        same attention level as the actual instruction."""
         adapter = _make_adapter()
         mock_result = {"final_response": "Hola", "messages": []}
         with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
@@ -246,9 +248,11 @@ class TestKrikiDeviceIdAndLanguage:
             ))
 
         assert resp.status == 200
-        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
-        assert "Spanish" in (ephemeral or "")
-        assert "Always respond in" in (ephemeral or "")
+        user_msg = mock_run.call_args.kwargs["user_message"]
+        assert "[Response language: Spanish]" in user_msg
+        # language no longer goes into ephemeral_system_prompt
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt")
+        assert ephemeral is None
 
     @pytest.mark.asyncio
     async def test_no_language_keeps_empty_ephemeral_prompt(self):
@@ -263,8 +267,9 @@ class TestKrikiDeviceIdAndLanguage:
         assert ephemeral is None
 
     @pytest.mark.asyncio
-    async def test_language_combined_with_fallback_instructions(self):
-        """language + instructions (when skill absent) are merged."""
+    async def test_language_in_user_message_instructions_in_ephemeral_when_skill_absent(self):
+        """When kriki-watch skill is absent: language goes into user message and
+        instructions go into ephemeral_system_prompt (legacy fallback)."""
         with patch("agent.skill_commands.build_skill_invocation_message", return_value=None):
             adapter = _make_adapter()
 
@@ -277,13 +282,18 @@ class TestKrikiDeviceIdAndLanguage:
                 "instructions": "You are a helpful assistant.",
             }))
 
+        user_msg = mock_run.call_args.kwargs["user_message"]
         ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
-        assert "Japanese" in (ephemeral or "")
+        # language is injected into user message
+        assert "[Response language: Japanese]" in user_msg
+        # instructions go into ephemeral only when skill is absent
         assert "You are a helpful assistant." in (ephemeral or "")
 
     @pytest.mark.asyncio
-    async def test_language_overrides_skill_absence_instructions_suppression(self):
-        """Even when kriki-watch is available, language still sets ephemeral prompt."""
+    async def test_language_in_user_message_instructions_ignored_when_skill_present(self):
+        """When kriki-watch skill is available: language goes into user message;
+        instructions are silently dropped (skill context already provides them)
+        and ephemeral_system_prompt stays None."""
         with patch("agent.skill_commands.build_skill_invocation_message",
                    return_value="[skill]\n___KRIKI_USER_INSTRUCTION___\n[end]"):
             adapter = _make_adapter()
@@ -297,17 +307,18 @@ class TestKrikiDeviceIdAndLanguage:
                 "instructions": "should be ignored",
             }))
 
-        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
-        # language directive present; instructions should NOT be merged when
-        # kriki-watch skill is available.
-        assert "zh-CN" in (ephemeral or "")
-        assert "should be ignored" not in (ephemeral or "")
+        user_msg = mock_run.call_args.kwargs["user_message"]
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt")
+        # language is in user message, not ephemeral
+        assert "[Response language: zh-CN]" in user_msg
+        # ephemeral stays None — skill is available and instructions are not merged
+        assert ephemeral is None
 
     # ── device_id + language combined ──────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_device_id_and_language_together(self):
-        """Both device_id and language can be provided simultaneously."""
+        """Both device_id and language are injected into the user message."""
         adapter = _make_adapter()
         mock_result = {"final_response": "ok", "messages": []}
         with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
@@ -320,9 +331,11 @@ class TestKrikiDeviceIdAndLanguage:
 
         assert resp.status == 200
         user_msg = mock_run.call_args.kwargs["user_message"]
-        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt", "")
         assert "[Target device: watch-001]" in user_msg
-        assert "zh-CN" in (ephemeral or "")
+        assert "[Response language: zh-CN]" in user_msg
+        # ephemeral stays None — both directives are in user message
+        ephemeral = mock_run.call_args.kwargs.get("ephemeral_system_prompt")
+        assert ephemeral is None
 
 
 class TestKrikiAgentCache:
@@ -362,17 +375,32 @@ class TestKrikiAgentCache:
         assert agent.run_conversation.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_rebuilds_agent_when_instructions_change(self):
+    async def test_ephemeral_prompt_injected_per_turn_not_per_agent(self):
+        """ephemeral_system_prompt (language, instructions) is now per-turn:
+        the SAME agent is reused even when the value changes between requests.
+        The agent's ephemeral_system_prompt is set before run_conversation and
+        restored after — agent creation is NOT triggered by prompt changes."""
         adapter = _make_adapter()
-        first_agent = MagicMock()
-        second_agent = MagicMock()
-        for agent in (first_agent, second_agent):
-            agent.session_prompt_tokens = 0
-            agent.session_completion_tokens = 0
-            agent.session_total_tokens = 0
-            agent.run_conversation.return_value = {"final_response": "ok", "messages": []}
+        agent = MagicMock()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.ephemeral_system_prompt = None  # initial state
 
-        with patch.object(adapter, "_create_agent", side_effect=[first_agent, second_agent]) as mock_create:
+        seen_prompts: list = []
+
+        def _run_conversation(**kwargs):
+            # Record the ephemeral prompt at call time so we can assert it
+            # was correctly injected per-turn.
+            seen_prompts.append(agent.ephemeral_system_prompt)
+            agent.session_prompt_tokens += 1
+            agent.session_completion_tokens += 1
+            agent.session_total_tokens += 2
+            return {"final_response": "ok", "messages": []}
+
+        agent.run_conversation.side_effect = _run_conversation
+
+        with patch.object(adapter, "_create_agent", return_value=agent) as mock_create:
             await adapter._run_agent(
                 user_message="hello",
                 conversation_history=[],
@@ -385,10 +413,19 @@ class TestKrikiAgentCache:
                 ephemeral_system_prompt="prompt two",
                 session_id="session-1",
             )
+            await adapter._run_agent(
+                user_message="final",
+                conversation_history=[],
+                ephemeral_system_prompt=None,
+                session_id="session-1",
+            )
 
-        assert mock_create.call_count == 2
-        assert mock_create.call_args_list[0].kwargs["ephemeral_system_prompt"] == "prompt one"
-        assert mock_create.call_args_list[1].kwargs["ephemeral_system_prompt"] == "prompt two"
+        # Agent created exactly once regardless of how many times the prompt changes.
+        mock_create.assert_called_once()
+        # Each turn saw its own ephemeral prompt.
+        assert seen_prompts == ["prompt one", "prompt two", None]
+        # After all turns the agent's ephemeral prompt is back to its initial value.
+        assert agent.ephemeral_system_prompt is None
 
     @pytest.mark.asyncio
     async def test_response_includes_session_header_for_reuse(self):
@@ -490,9 +527,12 @@ class TestKrikiAgentCache:
         assert mock_run.call_args.kwargs["user_message"] == "打开运动"
 
     @pytest.mark.asyncio
-    async def test_run_agent_temporarily_sets_stream_callbacks(self):
+    async def test_run_agent_temporarily_sets_stream_callbacks_and_ephemeral_prompt(self):
+        """All per-turn overrides (callbacks + ephemeral_system_prompt) are
+        set before run_conversation and restored to their previous values in
+        the finally block, so the cached agent is never left dirty."""
         adapter = _make_adapter()
-        seen_callbacks = {}
+        seen_state = {}
 
         class FakeAgent:
             def __init__(self):
@@ -503,10 +543,12 @@ class TestKrikiAgentCache:
                 self.tool_progress_callback = "old-progress"
                 self.tool_start_callback = "old-start"
                 self.tool_complete_callback = "old-complete"
+                self.ephemeral_system_prompt = "old-ephemeral"
 
             def run_conversation(self, **kwargs):
-                seen_callbacks["stream_delta_callback"] = self.stream_delta_callback
-                seen_callbacks["tool_start_callback"] = self.tool_start_callback
+                seen_state["stream_delta_callback"] = self.stream_delta_callback
+                seen_state["tool_start_callback"] = self.tool_start_callback
+                seen_state["ephemeral_system_prompt"] = self.ephemeral_system_prompt
                 self.session_prompt_tokens = 1
                 self.session_completion_tokens = 2
                 self.session_total_tokens = 3
@@ -522,16 +564,21 @@ class TestKrikiAgentCache:
                 session_id="session-1",
                 stream_delta_callback=delta_cb,
                 tool_start_callback=start_cb,
+                ephemeral_system_prompt="new-ephemeral",
             )
 
         assert result["final_response"] == "ok"
         assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
-        assert seen_callbacks["stream_delta_callback"] is delta_cb
-        assert seen_callbacks["tool_start_callback"] is start_cb
+        # During run_conversation the per-turn values were active.
+        assert seen_state["stream_delta_callback"] is delta_cb
+        assert seen_state["tool_start_callback"] is start_cb
+        assert seen_state["ephemeral_system_prompt"] == "new-ephemeral"
+        # After the call, all values are restored to what the agent had before.
         assert agent.stream_delta_callback == "old-delta"
         assert agent.tool_progress_callback == "old-progress"
         assert agent.tool_start_callback == "old-start"
         assert agent.tool_complete_callback == "old-complete"
+        assert agent.ephemeral_system_prompt == "old-ephemeral"
 
 
 class TestKrikiServerToolset:
