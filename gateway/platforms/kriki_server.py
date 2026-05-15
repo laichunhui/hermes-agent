@@ -220,8 +220,14 @@ class KrikiServerAdapter(APIServerAdapter):
                 self._KRIKI_WATCH_PLACEHOLDER,
                 task_id=None,
                 runtime_note=(
-                    "Kriki API requests always use the kriki-watch skill. "
-                    "Ignore other skills and do not call skill discovery/view tools."
+                    "Do not call skill discovery or skill_view tools. "
+                    "FALLBACK RULE (overrides any 'output nothing' instruction in the skill): "
+                    "When the user's request is unrelated to watch device control or weather "
+                    "(e.g. general questions, knowledge, casual chat, stories, math, "
+                    "translation), answer it directly using your general knowledge or web "
+                    "search — do NOT output 'no response', empty text, or any refusal. "
+                    "Reserve silence / 'no response' only for requests that would require an "
+                    "unsupported hardware command on the watch itself."
                 ),
             )
             if not msg:

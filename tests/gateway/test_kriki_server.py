@@ -505,6 +505,39 @@ class TestKrikiAgentCache:
         assert "[kriki-watch loaded]" in mock_run.call_args.kwargs["user_message"]
         assert "打开运动" in mock_run.call_args.kwargs["user_message"]
 
+    def test_runtime_note_contains_fallback_rule(self):
+        """The pre-loaded skill template must embed the FALLBACK RULE so the
+        model answers general questions instead of returning 'no response'."""
+        fake_msg = None
+        captured_kwargs = {}
+
+        def _capture(*args, **kwargs):
+            nonlocal fake_msg
+            captured_kwargs.update(kwargs)
+            fake_msg = (
+                f"[skill]\n{args[1] if len(args) > 1 else kwargs.get('user_instruction', '')}\n[/skill]"
+            )
+            return fake_msg
+
+        with patch("agent.skill_commands.build_skill_invocation_message", side_effect=_capture):
+            _make_adapter()
+
+        runtime_note = captured_kwargs.get("runtime_note", "")
+        rn_lower = runtime_note.lower()
+        assert "fallback" in rn_lower, (
+            "runtime_note must contain a FALLBACK RULE directive"
+        )
+        assert "no response" in rn_lower, (
+            "runtime_note must mention when NOT to output 'no response'"
+        )
+        assert "general" in rn_lower or "knowledge" in rn_lower, (
+            "runtime_note must explicitly cover general/knowledge questions"
+        )
+        # Must NOT forbid the agent from answering general questions
+        assert "always use the kriki-watch skill" not in rn_lower, (
+            "runtime_note must not force-lock the agent to only the kriki-watch skill"
+        )
+
     @pytest.mark.asyncio
     async def test_falls_back_to_raw_message_when_skill_unavailable(self):
         """When kriki-watch skill doesn't exist, messages pass through as-is."""
