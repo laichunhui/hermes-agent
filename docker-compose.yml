@@ -2,7 +2,7 @@
 # docker-compose.yml for Hermes Agent
 #
 # Usage:
-#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) KRIKI_SERVER_KEY=<your-key> docker compose up -d
 #
 # Set HERMES_UID / HERMES_GID to the host user that owns ~/.hermes so
 # files created inside the container stay readable/writable on the host.
@@ -17,6 +17,8 @@
 #   - The gateway's API server is off unless you uncomment API_SERVER_KEY
 #     and API_SERVER_HOST. See docs/user-guide/api-server.md before doing
 #     this on an internet-facing host.
+#   - Kriki server listens on 0.0.0.0:4088. KRIKI_SERVER_KEY is mandatory
+#     when binding to a network-accessible address.
 #
 services:
   gateway:
@@ -34,9 +36,25 @@ services:
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
       # - API_SERVER_KEY=${API_SERVER_KEY}
+
+      # -----------------------------------------------------------------
+      # Kriki Server — OpenAI Responses-compatible API (POST /v1/kriki/responses)
+      # KRIKI_SERVER_KEY is required; must be at least 8 chars.
+      # -----------------------------------------------------------------
+      - KRIKI_SERVER_KEY=${KRIKI_SERVER_KEY}
+      - KRIKI_SERVER_HOST=0.0.0.0
+      - KRIKI_SERVER_PORT=${KRIKI_SERVER_PORT:-4088}
+      # Model name returned in responses (cosmetic, does not select the LLM):
+      - KRIKI_SERVER_MODEL_NAME=${KRIKI_SERVER_MODEL_NAME:-kriki-agent}
+      # Per-session agent cache: max sessions kept in memory and idle TTL (seconds):
+      - KRIKI_AGENT_CACHE_MAX_SIZE=${KRIKI_AGENT_CACHE_MAX_SIZE:-128}
+      - KRIKI_AGENT_CACHE_IDLE_TTL=${KRIKI_AGENT_CACHE_IDLE_TTL:-3600}
+      # Optional CORS origins (comma-separated), e.g. "https://app.example.com":
+      # - KRIKI_SERVER_CORS_ORIGINS=${KRIKI_SERVER_CORS_ORIGINS}
     command: ["gateway", "run"]
 
   dashboard:
+    build: .
     image: hermes-agent
     container_name: hermes-dashboard
     restart: unless-stopped
