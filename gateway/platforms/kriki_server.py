@@ -570,12 +570,19 @@ class KrikiServerAdapter(APIServerAdapter):
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
+                logger.warning(
+                    "[kriki] previous_response_id=%s not found in response_store",
+                    previous_response_id,
+                )
                 return web.json_response(
                     _openai_error(f"Previous response not found: {previous_response_id}"),
                     status=404,
                 )
             conversation_history = list(stored.get("conversation_history", []))
-
+            logger.info(
+                "[kriki] loaded %d messages from previous_response_id=%s",
+                len(conversation_history), previous_response_id,
+            )
         for msg in input_messages[:-1]:
             conversation_history.append(msg)
 
