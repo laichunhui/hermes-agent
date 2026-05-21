@@ -332,10 +332,20 @@ class KrikiServerAdapter(APIServerAdapter):
         resolved_session_id = session_id or str(uuid.uuid4())
 
         def _run():
+            _t_exec_start = time.monotonic()
+            logger.info(
+                "[kriki-timing] sid=%s T_exec=0 executor started",
+                resolved_session_id,
+            )
             # Agent is keyed by session_id only.  ephemeral_system_prompt is
             # injected per-turn (see below) so language changes never cause
             # the agent to be discarded and conversation history is preserved.
             agent = self._get_cached_agent(resolved_session_id)
+            logger.info(
+                "[kriki-timing] sid=%s T_exec+%.2fs agent ready (cache_hit=%s)",
+                resolved_session_id, time.monotonic() - _t_exec_start,
+                resolved_session_id in self._agent_cache,
+            )
             if agent_ref is not None:
                 agent_ref[0] = agent
 
@@ -362,10 +372,21 @@ class KrikiServerAdapter(APIServerAdapter):
                 before_output = getattr(agent, "session_completion_tokens", 0) or 0
                 before_total = getattr(agent, "session_total_tokens", 0) or 0
                 try:
+                    _t_llm_start = time.monotonic()
+                    logger.info(
+                        "[kriki-timing] sid=%s T_exec+%.2fs entering run_conversation",
+                        resolved_session_id, _t_llm_start - _t_exec_start,
+                    )
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id="default",
+                    )
+                    logger.info(
+                        "[kriki-timing] sid=%s T_exec+%.2fs run_conversation returned (llm_wall=%.2fs)",
+                        resolved_session_id,
+                        time.monotonic() - _t_exec_start,
+                        time.monotonic() - _t_llm_start,
                     )
                     after_input = getattr(agent, "session_prompt_tokens", 0) or 0
                     after_output = getattr(agent, "session_completion_tokens", 0) or 0
@@ -382,6 +403,69 @@ class KrikiServerAdapter(APIServerAdapter):
             return result, usage
 
         return await loop.run_in_executor(None, _run)
+
+    def _persist_response_chain(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        result: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+        original_user_message: Any,
+        instructions: Optional[str],
+        session_id: str,
+        conversation: Optional[str],
+        response_envelope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist the turn into ``self._response_store`` for chaining via
+        ``previous_response_id``.
+
+        Unlike ``api_server._persist_response_snapshot``, this uses
+        ``result["messages"]`` as the *single* source of truth (avoiding the
+        ``append + extend`` duplication path) and rewrites the current turn's
+        user message back to the **unwrapped** content so device_id / language /
+        skill-injection metadata never bloats the stored history.
+        """
+        if not isinstance(result, dict):
+            return
+
+        agent_messages = list(result.get("messages") or [])
+        if agent_messages:
+            full_history: List[Dict[str, Any]] = agent_messages
+            # The agent saw the wrapped user message (with device_id /
+            # language / skill prefix); rewind the last user turn back to the
+            # original content for clean future chaining.
+            for i in range(len(full_history) - 1, -1, -1):
+                if full_history[i].get("role") == "user":
+                    full_history[i] = {"role": "user", "content": original_user_message}
+                    break
+        else:
+            full_history = list(conversation_history)
+            full_history.append({"role": "user", "content": original_user_message})
+            final = result.get("final_response") or ""
+            if final:
+                full_history.append({"role": "assistant", "content": final})
+
+        envelope = response_envelope or {
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "model": model,
+        }
+        try:
+            self._response_store.put(response_id, {
+                "response": envelope,
+                "conversation_history": full_history,
+                "instructions": instructions,
+                "session_id": session_id,
+            })
+            if conversation:
+                self._response_store.set_conversation(conversation, response_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist Kriki response %s for chaining: %s",
+                response_id, exc,
+            )
 
     @staticmethod
     def _extract_kriki_output_items(result: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -467,6 +551,31 @@ class KrikiServerAdapter(APIServerAdapter):
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
                 conversation_history.append({"role": str(entry["role"]), "content": content})
 
+        # Responses-API style chaining: clients may pass `previous_response_id`
+        # (or a `conversation` name shortcut) to resume a prior turn without
+        # having to ship the full history themselves.  Explicit
+        # `conversation_history` in the body takes precedence.
+        previous_response_id = body.get("previous_response_id")
+        conversation = body.get("conversation")
+        store = bool(body.get("store", True))
+
+        if conversation and previous_response_id:
+            return web.json_response(
+                _openai_error("Cannot use both 'conversation' and 'previous_response_id'"),
+                status=400,
+            )
+        if conversation:
+            previous_response_id = self._response_store.get_conversation(conversation)
+
+        if not conversation_history and previous_response_id:
+            stored = self._response_store.get(previous_response_id)
+            if stored is None:
+                return web.json_response(
+                    _openai_error(f"Previous response not found: {previous_response_id}"),
+                    status=404,
+                )
+            conversation_history = list(stored.get("conversation_history", []))
+
         for msg in input_messages[:-1]:
             conversation_history.append(msg)
 
@@ -474,8 +583,14 @@ class KrikiServerAdapter(APIServerAdapter):
         if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        # Preserve the original (un-wrapped) user content for history
+        # persistence.  device_id / language / skill wrapping is per-turn
+        # ephemeral context and must not bloat the stored history.
+        original_user_message: Any = user_message
+
         session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or str(uuid.uuid4())
-        print(f'start: {session_id}')
+        _t_req_start = time.monotonic()
+        logger.info("[kriki-timing] sid=%s T0 request received", session_id)
         # Extract optional per-request parameters.
         device_id: str = (body.get("device_id") or "").strip()
         language: str = (body.get("language") or "").strip()
@@ -509,20 +624,34 @@ class KrikiServerAdapter(APIServerAdapter):
         else:
             ephemeral_system_prompt = None
 
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
         stream = bool(body.get("stream", False))
         if stream:
             import queue as _q
 
             stream_q: _q.Queue = _q.Queue()
 
+            _first_delta_logged = [False]
+
             def _on_delta(delta):
                 if delta is not None:
+                    if not _first_delta_logged[0]:
+                        _first_delta_logged[0] = True
+                        logger.info(
+                            "[kriki-timing] sid=%s T+%.2fs first LLM token/delta",
+                            session_id, time.monotonic() - _t_req_start,
+                        )
                     stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 return
 
             def _on_tool_start(tool_call_id, function_name, function_args):
+                logger.info(
+                    "[kriki-timing] sid=%s T+%.2fs tool_start name=%s",
+                    session_id, time.monotonic() - _t_req_start, function_name,
+                )
                 stream_q.put(("__tool_started__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,
@@ -550,16 +679,46 @@ class KrikiServerAdapter(APIServerAdapter):
                 agent_ref=agent_ref,
             ))
 
+            # NOTE: store=False on the SSE writer because api_server's
+            # _persist_response_snapshot appends user_message AND extends
+            # result["messages"] (which already includes the user_message),
+            # producing duplicated history that doubles every turn.  We
+            # persist cleanly ourselves via a done-callback below.
+            if store:
+                _kriki_model = body.get("model", self._model_name)
+
+                def _persist_streaming_result(task: "asyncio.Future") -> None:
+                    if task.cancelled():
+                        return
+                    if task.exception() is not None:
+                        return
+                    try:
+                        result, _usage = task.result()
+                    except Exception:
+                        return
+                    self._persist_response_chain(
+                        response_id=response_id,
+                        model=_kriki_model,
+                        result=result,
+                        conversation_history=conversation_history,
+                        original_user_message=original_user_message,
+                        instructions=ephemeral_system_prompt,
+                        session_id=session_id,
+                        conversation=conversation,
+                    )
+
+                agent_task.add_done_callback(_persist_streaming_result)
+
             return await self._write_sse_responses(
                 request=request,
-                response_id=f"resp_{uuid.uuid4().hex[:28]}",
+                response_id=response_id,
                 model=body.get("model", self._model_name),
                 created_at=int(time.time()),
                 stream_q=stream_q,
                 agent_task=agent_task,
                 agent_ref=agent_ref,
                 conversation_history=conversation_history,
-                user_message=user_message,
+                user_message=original_user_message,
                 instructions=ephemeral_system_prompt,
                 conversation=None,
                 store=False,
@@ -582,7 +741,7 @@ class KrikiServerAdapter(APIServerAdapter):
 
         created_at = int(time.time())
         response_data = {
-            "id": f"resp_{uuid.uuid4().hex[:28]}",
+            "id": response_id,
             "object": "response",
             "status": "completed",
             "created_at": created_at,
@@ -594,6 +753,18 @@ class KrikiServerAdapter(APIServerAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if store:
+            self._persist_response_chain(
+                response_id=response_id,
+                model=response_data["model"],
+                result=result,
+                conversation_history=conversation_history,
+                original_user_message=original_user_message,
+                instructions=ephemeral_system_prompt,
+                session_id=session_id,
+                conversation=conversation,
+                response_envelope=response_data,
+            )
         return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 
     async def connect(self) -> bool:

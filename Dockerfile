@@ -28,7 +28,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # 第一批：通用基础工具
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ripgrep ffmpeg procps git openssh-client docker-cli tini && \
+    ripgrep ffmpeg procps git openssh-client docker-cli tini curl && \
     rm -rf /var/lib/apt/lists/*
 
 # 第二批：前端运行环境
