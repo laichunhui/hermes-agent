@@ -118,14 +118,23 @@ def _load_web_config() -> dict:
     except (ImportError, Exception):
         return {}
 
-def _get_backend() -> str:
-    """Determine which web backend to use.
+def _get_backend(role: str = "search") -> str:
+    """Determine which web backend to use for *role* ("search" or "extract").
 
-    Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
-    Falls back to whichever API key is present for users who configured
-    keys manually without running setup.
+    Reads, in order:
+      1. ``web.<role>_backend`` (e.g. ``web.search_backend``) — allows split
+         backends per role (search via Exa, extract via Firecrawl, etc.).
+      2. ``web.backend`` — legacy single-backend setting from ``hermes tools``.
+      3. Fallback by API-key availability.
     """
-    configured = (_load_web_config().get("backend") or "").lower().strip()
+    web_cfg = _load_web_config()
+
+    role_key = f"{role}_backend"
+    configured = (web_cfg.get(role_key) or "").lower().strip()
+    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+        return configured
+
+    configured = (web_cfg.get("backend") or "").lower().strip()
     if configured in ("parallel", "firecrawl", "tavily", "exa"):
         return configured
 
@@ -342,6 +351,69 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
     response = httpx.post(url, json=payload, timeout=60)
     response.raise_for_status()
     return response.json()
+
+
+# ---------------------------------------------------------------------------
+# Search-result description truncation
+# ---------------------------------------------------------------------------
+# Several backends (Firecrawl tool-gateway with scraping, Tavily with content
+# snippets, Exa with highlights) can return many KB of raw page markdown per
+# result in the "description" field. That balloons the main model's input
+# tokens from ~500 to 20k+, causing 20s+ response times, repetitive output,
+# and invalid-response retries.  280 chars is plenty for the agent to decide
+# whether a result is worth a follow-up web_extract — anything beyond that
+# is wasted prefill budget.
+_SEARCH_DESCRIPTION_MAX_CHARS = 280
+
+# Patterns used to strip markdown noise (headers, image refs, link syntax)
+# before truncating, so we don't burn the 280-char budget on "## 头条新闻"
+# / "![Image 12](https://...)" / "[link](url)" structural junk.
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_HEADER_BULLET_RE = re.compile(r"^[\s\>#*\-\d.]+", re.MULTILINE)
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _clean_description(text: str) -> str:
+    """Strip markdown noise from a search-result description.
+
+    Returns a single-line plain-text snippet suitable for the main model
+    to skim.  Best-effort; on any error returns the input unchanged.
+    """
+    try:
+        cleaned = _MD_IMAGE_RE.sub("", text)
+        cleaned = _MD_LINK_RE.sub(r"\1", cleaned)
+        cleaned = _MD_HEADER_BULLET_RE.sub("", cleaned)
+        cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
+        return cleaned
+    except Exception:
+        return text
+
+
+def _truncate_search_descriptions(response_data: dict) -> dict:
+    """Clean and cap each result's description to keep search payloads small.
+
+    Mutates *response_data* in place and returns it.  Safe on already-trimmed
+    or unexpected shapes.  Applied uniformly across all search backends.
+    """
+    try:
+        web = response_data.get("data", {}).get("web") if isinstance(response_data, dict) else None
+        if not isinstance(web, list):
+            return response_data
+        for item in web:
+            if not isinstance(item, dict):
+                continue
+            desc = item.get("description")
+            if not isinstance(desc, str) or not desc:
+                continue
+            cleaned = _clean_description(desc)
+            if len(cleaned) > _SEARCH_DESCRIPTION_MAX_CHARS:
+                cleaned = cleaned[:_SEARCH_DESCRIPTION_MAX_CHARS].rstrip() + "…"
+            item["description"] = cleaned
+    except Exception:
+        # Truncation is best-effort; never break the search call over it.
+        pass
+    return response_data
 
 
 def _normalize_tavily_search_results(response: dict) -> dict:
@@ -1127,10 +1199,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch to the configured backend
-        backend = _get_backend()
+        # Dispatch to the configured search backend
+        backend = _get_backend("search")
         if backend == "parallel":
-            response_data = _parallel_search(query, limit)
+            response_data = _truncate_search_descriptions(_parallel_search(query, limit))
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1139,7 +1211,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             return result_json
 
         if backend == "exa":
-            response_data = _exa_search(query, limit)
+            response_data = _truncate_search_descriptions(_exa_search(query, limit))
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1155,7 +1227,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_raw_content": False,
                 "include_images": False,
             })
-            response_data = _normalize_tavily_search_results(raw)
+            response_data = _truncate_search_descriptions(_normalize_tavily_search_results(raw))
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1165,22 +1237,30 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
+        # Firecrawl: pass timeout to cap server-side wait, and sources to skip
+        # news/images backends.  Falls back to bare call on older SDKs.
+        _fc_search_kwargs: Dict[str, Any] = {
+            "query": query,
+            "limit": limit,
+            "timeout": 15000,
+        }
+        try:
+            _fc_search_kwargs["sources"] = ["web"]
+            response = _get_firecrawl_client().search(**_fc_search_kwargs)
+        except TypeError:
+            response = _get_firecrawl_client().search(query=query, limit=limit)
 
         web_results = _extract_web_search_results(response)
         results_count = len(web_results)
         logger.info("Found %d search results", results_count)
-        
-        # Build response with just search metadata (URLs, titles, descriptions)
-        response_data = {
+
+        # Build response with just search metadata, then truncate descriptions
+        response_data = _truncate_search_descriptions({
             "success": True,
             "data": {
                 "web": web_results
             }
-        }
+        })
         
         # Capture debug information
         debug_call_data["results_count"] = results_count
@@ -1284,7 +1364,7 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_backend()
+            backend = _get_backend("extract")
 
             if backend == "parallel":
                 results = await _parallel_extract(safe_urls)
@@ -1586,7 +1666,7 @@ async def web_crawl_tool(
     try:
         effective_model = model or _get_default_summarizer_model()
         auxiliary_available = check_auxiliary_model()
-        backend = _get_backend()
+        backend = _get_backend("extract")
 
         # Tavily supports crawl via its /crawl endpoint
         if backend == "tavily":
