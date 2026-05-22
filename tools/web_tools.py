@@ -17,6 +17,7 @@ Backend compatibility:
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract, crawl)
+- Bocha: https://open.bochaai.com (search only; China-domestic, low-latency for cn-* networks)
 
 LLM Processing:
 - Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
@@ -131,11 +132,11 @@ def _get_backend(role: str = "search") -> str:
 
     role_key = f"{role}_backend"
     configured = (web_cfg.get(role_key) or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "bocha"):
         return configured
 
     configured = (web_cfg.get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "bocha"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -146,6 +147,7 @@ def _get_backend(role: str = "search") -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("bocha", _has_env("BOCHA_API_KEY")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -164,6 +166,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "bocha":
+        return _has_env("BOCHA_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -327,6 +331,121 @@ def _get_async_parallel_client():
             )
         _async_parallel_client = AsyncParallel(api_key=api_key)
     return _async_parallel_client
+
+# ─── Bocha Client ────────────────────────────────────────────────────────────
+# Bocha AI is a China-domestic web-search backend (https://open.bochaai.com/).
+# Useful when the agent runs inside mainland China — both the API origin and
+# the underlying search index live in-region, avoiding the 3-5s cross-border
+# latency that Tavily/Exa/Firecrawl incur for users on cn-* networks.
+
+_BOCHA_BASE_URL = os.getenv("BOCHA_BASE_URL", "https://api.bochaai.com")
+# Bocha's freshness filter accepts: oneDay / oneWeek / oneMonth / oneYear /
+# noLimit.  Default to noLimit so general queries aren't accidentally narrowed.
+_BOCHA_FRESHNESS = os.getenv("BOCHA_FRESHNESS", "noLimit")
+
+
+def _bocha_search(query: str, limit: int = 10) -> dict:
+    """Call Bocha web-search and normalize to {success, data: {web: [...]}}.
+
+    Bocha returns a Bing-style envelope:
+        {
+          "code": 200,
+          "data": {
+            "webPages": {
+              "value": [
+                {"name", "url", "snippet", "summary", "siteName",
+                 "datePublished", ...},
+                ...
+              ]
+            }
+          }
+        }
+
+    We map each item to the agent-facing {title, url, description, position}
+    shape, preferring `summary` over `snippet` when present (summary is the
+    AI-generated longer abstract; it gets capped to 280 chars downstream by
+    _truncate_search_descriptions).
+    """
+    api_key = os.getenv("BOCHA_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "BOCHA_API_KEY environment variable not set. "
+            "Get your API key at https://open.bochaai.com/"
+        )
+
+    url = f"{_BOCHA_BASE_URL}/v1/web-search"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    # Bocha caps `count` at 50.  Request `summary: true` so each result carries
+    # a meaningful description even without scraping — Bocha generates this
+    # server-side at no extra latency cost vs. snippet-only mode.
+    payload = {
+        "query": query,
+        "freshness": _BOCHA_FRESHNESS,
+        "summary": True,
+        "count": max(1, min(limit, 50)),
+    }
+    logger.info("Bocha search: '%s' (limit=%d)", query, payload["count"])
+    response = httpx.post(url, headers=headers, json=payload, timeout=15)
+    # Surface server-side error body — Bocha's 401/403/429 messages explain
+    # exactly which precondition failed (bad key, IP not whitelisted, quota
+    # exhausted), which httpx.raise_for_status() otherwise discards.
+    if response.status_code >= 400:
+        body_preview = ""
+        try:
+            body_preview = response.text[:400]
+        except Exception:
+            pass
+        # Auth-key hint: surface the key fingerprint (first 6 + last 4) so the
+        # user can confirm the env var actually loaded the expected key.
+        key_hint = ""
+        if api_key:
+            key_hint = f"{api_key[:6]}…{api_key[-4:]} (len={len(api_key)})"
+        raise RuntimeError(
+            f"Bocha API {response.status_code} for {url}. "
+            f"key={key_hint}. body={body_preview!r}"
+        )
+    raw = response.json()
+    # Bocha returns {code: 200, msg, data} on success; non-200 codes inside
+    # the JSON envelope are still HTTP 200 — handle them explicitly.
+    if isinstance(raw, dict) and raw.get("code") not in (None, 200, "200"):
+        raise RuntimeError(
+            f"Bocha API logical error: code={raw.get('code')} "
+            f"msg={raw.get('msg') or raw.get('message') or raw}"
+        )
+
+    # Tolerate both {data: {webPages: {value: [...]}}} (current docs) and a
+    # flat {webPages: {value: [...]}} shape (some wrappers).
+    data_section = raw.get("data") if isinstance(raw, dict) else None
+    if not isinstance(data_section, dict):
+        data_section = raw if isinstance(raw, dict) else {}
+    web_pages = data_section.get("webPages") or {}
+    items = web_pages.get("value") if isinstance(web_pages, dict) else None
+    if not isinstance(items, list):
+        items = []
+
+    web_results = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        # Prefer summary (longer AI abstract) > snippet (Bing-style highlight).
+        description = item.get("summary") or item.get("snippet") or ""
+        site_name = item.get("siteName") or ""
+        # Cheap source hint at the front of the description so the agent can
+        # tell where the content came from after the 280-char truncate runs.
+        if site_name and not description.startswith(site_name):
+            description = f"[{site_name}] {description}" if description else site_name
+        web_results.append({
+            "title": item.get("name", "") or "",
+            "url": item.get("url", "") or "",
+            "description": description,
+            "position": i + 1,
+        })
+
+    return {"success": True, "data": {"web": web_results}}
+
 
 # ─── Tavily Client ───────────────────────────────────────────────────────────
 
@@ -1219,6 +1338,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
+        if backend == "bocha":
+            response_data = _truncate_search_descriptions(_bocha_search(query, limit))
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
             raw = _tavily_request("search", {
@@ -2084,6 +2212,8 @@ if __name__ == "__main__":
             print("   Using Parallel API (https://parallel.ai)")
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
+        elif backend == "bocha":
+            print("   Using Bocha AI Search API (https://open.bochaai.com)")
         else:
             if firecrawl_url_available:
                 print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")
