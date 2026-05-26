@@ -570,19 +570,25 @@ class KrikiServerAdapter(APIServerAdapter):
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
+                # The prior turn was most likely cancelled before its
+                # persistence callback fired, or its record was evicted.
+                # Don't 404 — log a warning and proceed with empty history
+                # so the client can keep talking without restarting the
+                # session.  Callers that need strict chaining can detect
+                # the missing context themselves and re-send their full
+                # `conversation_history`.
                 logger.warning(
-                    "[kriki] previous_response_id=%s not found in response_store",
+                    "[kriki] previous_response_id=%s not found in "
+                    "response_store (likely cancelled or evicted); "
+                    "continuing with empty history",
                     previous_response_id,
                 )
-                return web.json_response(
-                    _openai_error(f"Previous response not found: {previous_response_id}"),
-                    status=404,
+            else:
+                conversation_history = list(stored.get("conversation_history", []))
+                logger.info(
+                    "[kriki] loaded %d messages from previous_response_id=%s",
+                    len(conversation_history), previous_response_id,
                 )
-            conversation_history = list(stored.get("conversation_history", []))
-            logger.info(
-                "[kriki] loaded %d messages from previous_response_id=%s",
-                len(conversation_history), previous_response_id,
-            )
         for msg in input_messages[:-1]:
             conversation_history.append(msg)
 
@@ -608,28 +614,18 @@ class KrikiServerAdapter(APIServerAdapter):
 
         # Build the ephemeral system prompt.
         #
-        # *language* and *device_id* are now injected directly into the user
-        # message (via _build_kriki_watch_message) so the model sees them at
-        # the same attention level as the actual instruction.  The ephemeral
-        # system prompt is therefore kept empty by default to maximise
-        # LLM prompt-cache hit rates.
+        # *language* and *device_id* are injected directly into the user
+        # message (via _build_kriki_watch_message) to keep them at the same
+        # attention level as the actual instruction.
         #
-        # The only exception is when the kriki-watch skill is unavailable AND
-        # the caller supplied explicit *instructions* — fall back to
-        # per-request instructions so clients still get some context (legacy
-        # behaviour).
+        # *instructions* — when supplied by the caller — is always set as the
+        # ephemeral system prompt for this turn, regardless of whether the
+        # kriki-watch skill is available.  Callers rely on it as a hard
+        # per-turn directive, so it must always reach the LLM.
         _instructions = body.get("instructions")
-        if _instructions is not None and self._kriki_watch_prefix is None:
-            # kriki-watch skill not available — fall back to per-request
-            # instructions so clients still get some context.
-            ephemeral_system_prompt = str(_instructions)
-            logger.debug(
-                "Kriki-watch skill unavailable, using per-request instructions "
-                "(%d chars) as ephemeral_system_prompt.",
-                len(ephemeral_system_prompt),
-            )
-        else:
-            ephemeral_system_prompt = None
+        ephemeral_system_prompt = (
+            str(_instructions) if _instructions is not None else None
+        )
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
 
@@ -695,14 +691,28 @@ class KrikiServerAdapter(APIServerAdapter):
                 _kriki_model = body.get("model", self._model_name)
 
                 def _persist_streaming_result(task: "asyncio.Future") -> None:
-                    if task.cancelled():
-                        return
-                    if task.exception() is not None:
-                        return
-                    try:
-                        result, _usage = task.result()
-                    except Exception:
-                        return
+                    # Persist on every terminal state (success, cancellation,
+                    # exception) so the response_id that has already been sent
+                    # down the SSE stream stays usable as
+                    # `previous_response_id` on the next turn.  Without this,
+                    # a cancelled request leaves a dangling id and the
+                    # follow-up call 404s.
+                    result: Optional[Dict[str, Any]] = None
+                    if not task.cancelled():
+                        try:
+                            if task.exception() is None:
+                                result, _usage = task.result()
+                        except Exception:
+                            result = None
+
+                    if not isinstance(result, dict):
+                        # Minimal placeholder — _persist_response_chain
+                        # handles empty `messages` by reconstructing history
+                        # from conversation_history + original_user_message,
+                        # which is exactly what we want for a turn that
+                        # never produced an assistant reply.
+                        result = {"messages": [], "final_response": ""}
+
                     self._persist_response_chain(
                         response_id=response_id,
                         model=_kriki_model,
