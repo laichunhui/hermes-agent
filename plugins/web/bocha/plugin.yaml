@@ -1,0 +1,7 @@
+name: web-bocha
+version: 1.0.0
+description: "Bocha AI Search (博查) — China-domestic web search API. Requires BOCHA_API_KEY from https://open.bochaai.com (free trial quota available)."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - bocha

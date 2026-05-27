@@ -140,7 +140,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "bocha"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -155,6 +155,7 @@ def _get_backend() -> str:
         ("exa", _has_env("EXA_API_KEY")),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
+        ("bocha", _has_env("BOCHA_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
@@ -216,6 +217,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
         return _has_env("BRAVE_SEARCH_API_KEY")
+    if backend == "bocha":
+        return _has_env("BOCHA_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
     if backend == "xai":
@@ -1367,11 +1370,11 @@ async def web_crawl_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "bocha", "ddgs"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "bocha", "ddgs")
     )
 
 
@@ -1411,6 +1414,8 @@ if __name__ == "__main__":
             print(f"   Using SearXNG (search only): {os.getenv('SEARXNG_URL', '').strip()}")
         elif backend == "brave-free":
             print("   Using Brave Search free tier (search only)")
+        elif backend == "bocha":
+            print("   Using Bocha AI Search (search only): https://open.bochaai.com")
         elif backend == "ddgs":
             print("   Using DuckDuckGo via ddgs package (search only)")
         elif firecrawl_url_available:
