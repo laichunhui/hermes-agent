@@ -389,6 +389,25 @@ TOOLSETS = {
         ],
         "includes": []
     },
+
+    "hermes-kriki-server": {
+        "description": "Kriki watch API server — narrow watch-control tool surface with skills preloaded outside the model",
+        "tools": [
+            # Web
+            "web_search", "web_extract",
+            # Terminal + process management
+            "terminal", "process",
+             # File manipulation
+            "read_file", "patch", "search_files",
+            # Skills
+            "skills_list", "skill_view",
+            # Planning & memory
+            "todo", "memory",
+            # Session history search
+            "session_search",
+        ],
+        "includes": []
+    },
     
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",

@@ -178,6 +178,7 @@ class TestResetPolicyNotify:
     def test_notify_exclude_defaults(self):
         policy = SessionResetPolicy()
         assert "api_server" in policy.notify_exclude_platforms
+        assert "kriki_server" in policy.notify_exclude_platforms
         assert "webhook" in policy.notify_exclude_platforms
 
     def test_from_dict_with_notify_false(self):
@@ -194,6 +195,7 @@ class TestResetPolicyNotify:
         policy = SessionResetPolicy.from_dict({})
         assert policy.notify is True
         assert "api_server" in policy.notify_exclude_platforms
+        assert "kriki_server" in policy.notify_exclude_platforms
 
     def test_to_dict_roundtrip(self):
         original = SessionResetPolicy(

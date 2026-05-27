@@ -118,6 +118,7 @@ class Platform(Enum):
     SMS = "sms"
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
+    KRIKI_SERVER = "kriki_server"
     WEBHOOK = "webhook"
     MSGRAPH_WEBHOOK = "msgraph_webhook"
     FEISHU = "feishu"
@@ -249,7 +250,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "kriki_server", "webhook")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -273,7 +274,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=_coerce_bool(notify, True),
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "kriki_server", "webhook"),
         )
 
 
@@ -1465,6 +1466,33 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # Kriki Server
+    kriki_server_enabled = os.getenv("KRIKI_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
+    kriki_server_key = os.getenv("KRIKI_SERVER_KEY", "")
+    kriki_server_cors_origins = os.getenv("KRIKI_SERVER_CORS_ORIGINS", "")
+    kriki_server_port = os.getenv("KRIKI_SERVER_PORT")
+    kriki_server_host = os.getenv("KRIKI_SERVER_HOST")
+    if kriki_server_enabled or kriki_server_key:
+        if Platform.KRIKI_SERVER not in config.platforms:
+            config.platforms[Platform.KRIKI_SERVER] = PlatformConfig()
+        config.platforms[Platform.KRIKI_SERVER].enabled = True
+        if kriki_server_key:
+            config.platforms[Platform.KRIKI_SERVER].extra["key"] = kriki_server_key
+        if kriki_server_cors_origins:
+            origins = [origin.strip() for origin in kriki_server_cors_origins.split(",") if origin.strip()]
+            if origins:
+                config.platforms[Platform.KRIKI_SERVER].extra["cors_origins"] = origins
+        if kriki_server_port:
+            try:
+                config.platforms[Platform.KRIKI_SERVER].extra["port"] = int(kriki_server_port)
+            except ValueError:
+                pass
+        if kriki_server_host:
+            config.platforms[Platform.KRIKI_SERVER].extra["host"] = kriki_server_host
+        kriki_server_model_name = os.getenv("KRIKI_SERVER_MODEL_NAME", "")
+        if kriki_server_model_name:
+            config.platforms[Platform.KRIKI_SERVER].extra["model_name"] = kriki_server_model_name
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}

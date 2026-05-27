@@ -1906,7 +1906,7 @@ class GatewayRunner:
             return
 
         connected = self.config.get_connected_platforms()
-        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
+        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.KRIKI_SERVER, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
 
@@ -6326,6 +6326,13 @@ class GatewayRunner:
                 return None
             return APIServerAdapter(config)
 
+        elif platform == Platform.KRIKI_SERVER:
+            from gateway.platforms.kriki_server import KrikiServerAdapter, check_kriki_server_requirements
+            if not check_kriki_server_requirements():
+                logger.warning("Kriki Server: aiohttp not installed")
+                return None
+            return KrikiServerAdapter(config)
+
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
             if not check_webhook_requirements():
@@ -8218,7 +8225,7 @@ class GatewayRunner:
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
-            # - the platform is excluded (e.g. api_server, webhook)
+            # - the platform is excluded (e.g. api_server, kriki_server, webhook)
             # - the expired session had no activity (nothing was cleared)
             try:
                 policy = self.session_store.config.get_reset_policy(
