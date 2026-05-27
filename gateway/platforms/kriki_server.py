@@ -41,6 +41,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 4088
 DEFAULT_AGENT_CACHE_MAX_SIZE = 128
 DEFAULT_AGENT_CACHE_IDLE_TTL_SECS = 3600.0
+DEFAULT_AGENT_INACTIVITY_TIMEOUT_SECS = 120.0
 KRIKI_WATCH_COMMAND = "/kriki-watch"
 
 
@@ -75,6 +76,12 @@ class KrikiServerAdapter(APIServerAdapter):
         )
         self._agent_cache_idle_ttl = float(
             extra.get("agent_cache_idle_ttl", os.getenv("KRIKI_AGENT_CACHE_IDLE_TTL", str(DEFAULT_AGENT_CACHE_IDLE_TTL_SECS)))
+        )
+        self._agent_inactivity_timeout = float(
+            extra.get(
+                "agent_inactivity_timeout",
+                os.getenv("KRIKI_AGENT_INACTIVITY_TIMEOUT", str(DEFAULT_AGENT_INACTIVITY_TIMEOUT_SECS)),
+            )
         )
         self._agent_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._agent_cache_lock = threading.RLock()
@@ -636,6 +643,13 @@ class KrikiServerAdapter(APIServerAdapter):
             stream_q: _q.Queue = _q.Queue()
 
             _first_delta_logged = [False]
+            # Mutable single-cell list so the executor-thread callbacks and the
+            # async watchdog can share a wall-clock timestamp without locks
+            # (Python attribute-set on a list element is GIL-atomic).
+            _last_activity = [time.monotonic()]
+
+            def _bump_activity():
+                _last_activity[0] = time.monotonic()
 
             def _on_delta(delta):
                 if delta is not None:
@@ -645,9 +659,11 @@ class KrikiServerAdapter(APIServerAdapter):
                             "[kriki-timing] sid=%s T+%.2fs first LLM token/delta",
                             session_id, time.monotonic() - _t_req_start,
                         )
+                    _bump_activity()
                     stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                _bump_activity()
                 return
 
             def _on_tool_start(tool_call_id, function_name, function_args):
@@ -655,6 +671,7 @@ class KrikiServerAdapter(APIServerAdapter):
                     "[kriki-timing] sid=%s T+%.2fs tool_start name=%s",
                     session_id, time.monotonic() - _t_req_start, function_name,
                 )
+                _bump_activity()
                 stream_q.put(("__tool_started__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,
@@ -662,6 +679,7 @@ class KrikiServerAdapter(APIServerAdapter):
                 }))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+                _bump_activity()
                 stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,
@@ -681,6 +699,65 @@ class KrikiServerAdapter(APIServerAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
             ))
+
+            # Inactivity watchdog: if no streamed delta / tool event arrives
+            # for `self._agent_inactivity_timeout` seconds, assume the agent
+            # is wedged (hung LLM HTTP call, hung tool, etc.) and force a
+            # terminal state.  We call `agent.interrupt()` to nudge the
+            # executor thread out of its blocking call, cancel the asyncio
+            # future, and push an EOS sentinel so the SSE writer's queue
+            # loop wakes up immediately instead of waiting on the next
+            # 0.5s poll.  Once `agent_task` resolves (success, exception,
+            # or cancellation), api_server._write_sse_responses emits
+            # `response.completed` / `response.failed` as appropriate.
+            inactivity_timeout = self._agent_inactivity_timeout
+            watchdog_task: Optional[asyncio.Task] = None
+
+            if inactivity_timeout > 0:
+                async def _inactivity_watchdog() -> None:
+                    poll_interval = max(1.0, min(5.0, inactivity_timeout / 4))
+                    try:
+                        while not agent_task.done():
+                            await asyncio.sleep(poll_interval)
+                            if agent_task.done():
+                                return
+                            idle = time.monotonic() - _last_activity[0]
+                            if idle < inactivity_timeout:
+                                continue
+                            logger.warning(
+                                "[kriki] sid=%s agent inactive for %.1fs "
+                                "(> %.0fs timeout); interrupting and cancelling",
+                                session_id, idle, inactivity_timeout,
+                            )
+                            agent = agent_ref[0]
+                            if agent is not None:
+                                try:
+                                    agent.interrupt(
+                                        f"inactivity timeout {int(inactivity_timeout)}s"
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "[kriki] sid=%s agent.interrupt() failed: %s",
+                                        session_id, exc,
+                                    )
+                            # Wake the SSE drain loop so it doesn't sit on
+                            # its 0.5s blocking queue.get for another tick.
+                            try:
+                                stream_q.put(None)
+                            except Exception:
+                                pass
+                            agent_task.cancel()
+                            return
+                    except asyncio.CancelledError:
+                        return
+
+                watchdog_task = asyncio.ensure_future(_inactivity_watchdog())
+
+                def _stop_watchdog(_t: "asyncio.Future") -> None:
+                    if watchdog_task is not None and not watchdog_task.done():
+                        watchdog_task.cancel()
+
+                agent_task.add_done_callback(_stop_watchdog)
 
             # NOTE: store=False on the SSE writer because api_server's
             # _persist_response_snapshot appends user_message AND extends
